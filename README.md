@@ -50,6 +50,9 @@ To ensure full reproducibility, we recommend using Conda to manage your Python e
 3. `supp_figures.ipynb`
    * Reads pre-computed posteriors and produces the supplementary figures, saving them to the `figures/` folder.
 
+### A Note on Units
+Please note that all raw data, internal calculations, and Bayesian posteriors saved in the `results/` folder use **µg/mL** for ciprofloxacin concentrations. However, for clarity and readability, the figures generated in the notebooks and presented in the manuscript display the concentrations in **ng/mL** (a conversion factor of 1000). If you are inspecting the code or raw data tables, keep in mind that a value like `0.015` corresponds to `15 ng/mL` in the paper.
+
 ## Citation
 
 If you use this code or model in your research, please cite our manuscript:
