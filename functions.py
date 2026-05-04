@@ -469,6 +469,9 @@ def solve_mic(r0, q, c0, alpha):
     float
         MIC estimate in µg/mL, or np.nan if the solver fails to bracket a root.
     """
+
+    # Note: Returns MIC in µg/mL. Multiply by 1000 when plotting for the manuscript (ng/mL).
+    
     def equation(MIC):
         # Rewritten as f(MIC) = 0 for root_scalar
         return q * MIC * (1 + (MIC / c0) ** alpha) - r0
