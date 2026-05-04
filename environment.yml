@@ -1,0 +1,14 @@
+name: cip_model
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - jupyter
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pymc>=5.0
+  - arviz
