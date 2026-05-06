@@ -12,7 +12,7 @@ Applying the model across a range of growth conditions—including varying carbo
 
 ## Repository Structure
 
-* `preprocessing_median.py`: Script to generate the rolling median data from raw OD data. Cfreates the file 'cip_dose_response_all.csv' from 'cip_dose_response_raw.csv'. No need to run this, it is included for reproducibility.
+* `preprocessing_median.py`: Script to generate the rolling median data from raw OD data. Creates the file 'cip_dose_response_all.csv' from 'cip_dose_response_raw.csv'. No need to run this, it is included for reproducibility.
 * `functions.py`: Shared utilities for Bayesian inference, model simulation, and plotting used throughout the analysis. Contains the core logic for the five-parameter logistic model and MIC extraction.
 * `cip_model_bayesian_inference.ipynb`: The core modeling notebook. It runs all MCMC fits and computes the intermediate results (NetCDF posteriors, CSV summary tables) across diverse conditions (glucose, glycerol, TMP, CHL).
 * `main_figures.ipynb`: Generates the main figures of the manuscript (Figs. 1–4).
