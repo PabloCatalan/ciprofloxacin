@@ -1,532 +1,545 @@
 """
 functions.py
 ============
-Shared utilities for Bayesian inference, model simulation, and plotting used
-throughout the ciprofloxacin dose-response analysis.
+Shared code for the ciprofloxacin (CIP) dose-response analysis: model
+equations, data loading, Bayesian inference, posterior summaries and the
+plotting helpers used by more than one notebook.
 
-All functions are imported via `from functions import *` in the three analysis
-notebooks:
-  - cip_model_bayesian_inference.ipynb  (inference + intermediate results)
-  - main_figures.ipynb                  (Figs 1–4)
-  - supp_figures.ipynb                  (Figs S1–S6)
+All three notebooks start with ``from functions import *``:
 
-References
-----------
-Model derivation: see Section 2.1 of the manuscript (Eq. 3–5).
-Bayesian inference details: Materials and Methods section.
+  - cip_model_bayesian_inference.ipynb   all fits and intermediate results
+  - main_figures.ipynb                   Figs. 1-5
+  - supp_figures.ipynb                   Figs. S1-S7
+
+Units: CIP concentrations are in ug/mL everywhere in the code and in the
+saved results; figures display ng/mL (factor 1000).
+
+Model (manuscript Section 2)
+----------------------------
+On the invariant manifold phi = phi*(c) the fork/cell system (Eq. 1) reduces
+exactly to a logistic equation with (Eq. 13)
+
+    h(c)   = 1 + (c/c0)**alpha
+    Phi(c) = (sqrt(1 + psi*h) - 1) / (sqrt(1 + psi) - 1)
+    r(c)   = r0 * Phi(c) * (1 - q*c*h) / h
+    K(c)   = K0 * (1 - q*c*h)
+
+Fixing the fork completion rate d = 1 1/h gives psi = 4*r0*(1 + r0) and the
+five-parameter model (r0, K0, q, c0, alpha) used throughout the paper. The
+MIC c* solves q*c*h(c*) = 1 (Eq. 15).
 """
 
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-import matplotlib.gridspec as gridspec
-import pylab
-import numpy as np
-from scipy.integrate import solve_ivp
-import itertools
-import subprocess
-import pandas as pd
 import os
-from scipy.optimize import curve_fit, root_scalar
-from scipy.stats import median_abs_deviation
-import pymc as pm
+
 import arviz as az
+import matplotlib
+import matplotlib.gridspec as gridspec  # noqa: F401  (re-exported to the notebooks)
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pymc as pm
+from scipy.integrate import solve_ivp  # noqa: F401  (re-exported to the notebooks)
+from scipy.optimize import root_scalar
 
 # ---------------------------------------------------------------------------
-# Global plot style
+# Global settings
 # ---------------------------------------------------------------------------
-matplotlib.rcParams['font.family'] = "sans-serif"
-matplotlib.rcParams['font.sans-serif'] = "Arial"
+matplotlib.rcParams['font.family'] = 'sans-serif'
+matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 
-# Fixed random seed for reproducibility of any stochastic plotting operations
-# (e.g. random draws from the posterior used in posterior-predictive plots).
+# One seed for MCMC sampling and for the posterior draws used in plots, so
+# that re-running the notebooks top to bottom gives identical output.
 RANDOM_SEED = 89271458
 rng = np.random.default_rng(RANDOM_SEED)
+
+DATA_FILE = 'data/cip_dose_response_all.csv'
+T_MAX = 12.0           # all fits use the first 12 h of each growth curve (h)
+Y0_STANDARD = 0.001    # inoculum OD, first experimental series (standard medium)
+Y0_MEDIA = 0.003       # inoculum OD, second series (glucose, glycerol, TMP, CHL)
+MEDIA = ['glucose', 'glycerol', 'TMP', 'CHL']
+MODEL_PARAMS = ['r0', 'K0', 'q', 'c0', 'alpha']
+ALPHA_FIXED = 6.0      # centre of the narrow alpha prior in the fixed-alpha fits (Fig. S7)
+
+# Wells excluded from every fit and every plot. On the CHL plate (day 251203)
+# rows F and G failed to grow in all wells, including the drug-free
+# controls: a plating failure, not a biological effect (see Methods).
+EXCLUDED_ROWS = {'251203': ('F', 'G')}
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+def load_data(medium=None, t_max=T_MAX, path=DATA_FILE):
+    """
+    Load the smoothed dose-response data, keep t < t_max and drop the
+    excluded wells (EXCLUDED_ROWS).
+
+    Columns used downstream: 'medium', 'rep', 'day', 'well', 'dosis' (medium
+    or co-treatment dose), 'dosisAb' (CIP, ug/mL), 'Minutes', 'Hours',
+    'ODsmooth' (rolling-median OD600, see preprocessing_median.py).
+    """
+    df = pd.read_csv(path)
+    keep = df['Hours'] < t_max
+    if medium is not None:
+        keep &= df['medium'] == medium
+    day = df['day'].astype(str)
+    row = df['well'].str[0]
+    for bad_day, bad_rows in EXCLUDED_ROWS.items():
+        keep &= ~((day == bad_day) & row.isin(bad_rows))
+    return df[keep].copy()
+
+
+def medium_conditions(df):
+    """Medium/co-treatment doses present in df, highest first (fitting order)."""
+    return sorted(df['dosis'].unique(), reverse=True)
 
 
 # ---------------------------------------------------------------------------
 # Model equations
 # ---------------------------------------------------------------------------
+_EPS = 1e-12
 
-def g(c, t, y0, r0, K0, q, c0, alpha):
+
+def hill(c, c0, alpha):
+    """Hill factor h(c) = 1 + (c/c0)**alpha (Eq. 2)."""
+    return 1.0 + (c / (c0 + _EPS)) ** alpha
+
+
+def growth_params(c, r0, K0, q, c0, alpha, psi=None):
     """
-    Closed-form solution of the CIP logistic model (manuscript Eq. 5).
+    Concentration-dependent growth rate r(c) and carrying capacity K(c)
+    (Eq. 13). With psi=None, d = 1 1/h is imposed so psi = 4*r0*(1 + r0).
 
-    The model collapses the two-ODE fork/cell system into a single logistic
-    equation via quasi-steady-state reduction (Eq. 3).  The CIP-dependent
-    growth rate and carrying capacity are:
-
-        r(c) = r0 / (1 + (c/c0)^alpha) - q*c          (Eq. 4, left)
-        K(c) = K0 * (1 - q*c*(1 + (c/c0)^alpha) / r0)  (Eq. 4, right)
-
-    The logistic ODE dN/dt = r(c)*N*(1 - N/K(c)) has the explicit solution
-    returned here (Eq. 5).
-
-    Parameters
-    ----------
-    c : float or array-like
-        Ciprofloxacin concentration (µg/mL).
-    t : float or array-like
-        Time (hours).
-    y0 : float
-        Initial cell density (OD_600).
-    r0 : float
-        Antibiotic-free growth rate (h^-1).
-    K0 : float
-        Antibiotic-free carrying capacity (OD units).
-    q : float
-        CIP killing efficiency (mL/µg/h); controls the linear death term.
-    c0 : float
-        Half-saturation concentration for fork stalling (µg/mL); the
-        concentration at which the fork-initiation rate is halved.
-    alpha : float
-        Hill coefficient encoding cooperativity of CIP–gyrase binding.
-
-    Returns
-    -------
-    float or ndarray
-        Predicted OD_600 at time t for concentration c.
+    Above the MIC both r(c) and K(c) are negative: they share the factor
+    1 - q*c*h(c). They are deliberately not clamped at zero (see g()).
+    Works with numpy arrays and with PyMC tensors.
     """
-    # Small epsilon prevents division by zero if r0 or c0 are exactly 0
-    eps = 1e-6
-    r0_safe = r0 + eps
-    c0_safe = c0 + eps
-
-    # Concentration-dependent carrying capacity K(c)
-    K = K0 - K0 * q * c * (1 + (c / c0_safe) ** alpha) / r0_safe
-
-    # Concentration-dependent net growth rate r(c):
-    # the Hill term captures fork stalling (bacteriostatic effect);
-    # the q*c term is direct lethal killing (bactericidal effect).
-    r = r0 / (1 + (c / c0_safe) ** alpha) - q * c
-
-    # Standard logistic closed-form solution N(t)
-    return (K * y0) / (y0 + (K - y0) * np.exp(-r * t))
+    h = hill(c, c0, alpha)
+    if psi is None:  # d = 1:  sqrt(1 + psi) = 1 + 2*r0
+        Phi = (np.sqrt(1.0 + 4.0 * r0 * (1.0 + r0) * h) - 1.0) / (2.0 * r0 + _EPS)
+    else:
+        Phi = (np.sqrt(1.0 + psi * h) - 1.0) / (np.sqrt(1.0 + psi) - 1.0 + _EPS)
+    surv = 1.0 - q * c * h
+    return r0 * Phi * surv / h, K0 * surv
 
 
 def logistic(t, y0, r, K):
-    """
-    Standard (antibiotic-free) logistic growth curve.
-
-    Used as the baseline comparison model: each CIP concentration is fitted
-    independently with its own (r, K) pair, without any mechanistic
-    constraint linking curves across concentrations.  This is the "logistic"
-    reference in Fig. 1B and panels C–D.
-
-    Parameters
-    ----------
-    t : array-like
-        Time (hours).
-    y0 : float
-        Initial OD_600.
-    r : float
-        Growth rate (h^-1).
-    K : float
-        Carrying capacity (OD units).
-
-    Returns
-    -------
-    ndarray
-        OD_600 at each time point.
-    """
+    """Closed-form solution of dN/dt = r N (1 - N/K), N(0) = y0 (Eq. 14)."""
     return (K * y0) / (y0 + (K - y0) * np.exp(-r * t))
+
+
+def g(c, t, y0, r0, K0, q, c0, alpha, psi=None):
+    """
+    Model prediction of OD600 at time t (h) and CIP concentration c (ug/mL):
+    Eq. (14) with r(c), K(c) from Eq. (13).
+
+    Above the MIC r and K are both negative, the denominator never crosses
+    zero and N(t) decays monotonically to 0, so no clamping is needed.
+    """
+    r, K = growth_params(c, r0, K0, q, c0, alpha, psi)
+    return logistic(t, y0, r, K)
+
+
+def phi_star(c, r0, c0, alpha):
+    """
+    Fork density on the invariant manifold (forks per cell, Eq. 6) with
+    d = 1 1/h, so that phi*(0) = r0:
+        phi*(c) = (sqrt(1 + 4 r0 (1 + r0) h(c)) - 1) / 2
+    """
+    return 0.5 * (np.sqrt(1.0 + 4.0 * r0 * (1.0 + r0) * hill(c, c0, alpha)) - 1.0)
+
+
+def two_ode_rhs(t, y, c, r0, K0, q, c0, alpha, d=1.0):
+    """
+    Right-hand side of the full fork/cell system (Eq. 1), y = [f, N],
+    written in terms of the fitted parameters:
+        lambda0 = r0 (1 + r0/d)   so that phi*(0) = r0/d,
+        kappa   = q d.
+    Used in Fig. S1 to check the logistic reduction.
+    """
+    f, N = y
+    lam0 = r0 * (1.0 + r0 / d)
+    kappa = q * d
+    gN = 1.0 - N / K0
+    dc = d / hill(c, c0, alpha)
+    phi = f / N
+    return [gN * (lam0 * N - dc * f) - kappa * c * phi * f,
+            gN * dc * f - kappa * c * f]
+
+
+# ---------------------------------------------------------------------------
+# MIC
+# ---------------------------------------------------------------------------
+
+def solve_mic(q, c0, alpha):
+    """
+    MIC c* (ug/mL) for one parameter vector: the root of
+        q c* (1 + (c*/c0)**alpha) = 1          (Eq. 15)
+    found with Brent's method on [0, 1000] ug/mL. Returns np.nan if there is
+    no root in that bracket.
+    """
+    def f(c):
+        return q * c * (1.0 + (c / c0) ** alpha) - 1.0
+    try:
+        return root_scalar(f, bracket=[0.0, 1000.0], method='brentq').root
+    except ValueError:
+        return np.nan
+
+
+_solve_mic_vec = np.vectorize(solve_mic)
+
+
+def get_mic(idata, output='simple'):
+    """
+    Posterior distribution of the MIC, computed from every posterior sample.
+
+    output='simple' -> (mean, sd) in ug/mL
+    output='full'   -> array of all valid (non-NaN) MIC samples
+    """
+    post = idata.posterior
+    mic = _solve_mic_vec(post['q'].values.ravel(),
+                         post['c0'].values.ravel(),
+                         post['alpha'].values.ravel())
+    mic = mic[~np.isnan(mic)]
+    if output == 'full':
+        return mic
+    return float(np.mean(mic)), float(np.std(mic))
 
 
 # ---------------------------------------------------------------------------
 # Bayesian inference
 # ---------------------------------------------------------------------------
 
-def fit_model(DF, filename, y0_input, draws=1000):
+def _save(idata, filename):
+    groups = [grp for grp in ('posterior', 'sample_stats') if grp in idata.groups()]
+    idata.to_netcdf(filename, groups=groups)
+
+
+def fit_model(DF, filename, y0, draws=1000, alpha_fixed=None, fit_psi=False,
+              init='jitter+adapt_full', target_accept=0.95, refit=False):
     """
-    Fit the five-parameter CIP logistic model to a single experimental condition
-    using Bayesian MCMC inference (PyMC + NUTS sampler).
+    Fit Eq. (14) simultaneously to all CIP curves in DF with one shared
+    parameter set (PyMC, NUTS, 4 chains, 2000 tuning steps).
 
-    All CIP dose-response curves from the provided DataFrame are fitted
-    *simultaneously* with a single shared parameter set (r0, K0, q, c0, alpha),
-    which is what constrains the model across concentrations and enables
-    robust MIC estimation (see Section 2.2 and Materials & Methods).
+    If `filename` already exists and refit is False, the stored posterior is
+    loaded instead of re-sampling. Delete the file (or pass refit=True) to
+    fit again.
 
-    The posterior is stored as a NetCDF file for later loading with ArviZ.
+    Priors (Materials and Methods):
+        r0    ~ HalfNormal(1)
+        K0    ~ HalfNormal(1)
+        q     ~ HalfNormal(10)
+        c0    ~ LogNormal(log 0.01, 1)
+        alpha ~ HalfNormal(4)           or Normal(alpha_fixed, 0.1) if given
+        sigma ~ HalfNormal(0.1)         Normal likelihood on ODsmooth
+    fit_psi=True adds psi ~ HalfNormal(4) (six-parameter model, Section 2;
+    not used for any figure).
 
-    Parameters
-    ----------
-    DF : pd.DataFrame
-        Tidy DataFrame for one experimental replicate / medium condition.
-        Must contain columns: 'dosisAb' (CIP concentration), 'Hours' (time),
-        'ODsmooth' (rolling-median-smoothed OD_600).
-    filename : str
-        Path to the output NetCDF file (e.g. 'results/cip_model_standard_1_12h.nc').
-    y0_input : float
-        Fixed initial OD_600 (N0 in the model); set to the inoculum density.
-    draws : int
-        Number of posterior samples per chain (default 1000).
-        The tuning phase always uses 2000 steps.
-
-    Returns
-    -------
-    arviz.InferenceData
-        Posterior samples, also saved to `filename`.
-
-    Notes
-    -----
-    Priors (see Materials & Methods):
-      r0    ~ HalfNormal(sigma=1.0)    — positive growth rate
-      K0    ~ HalfNormal(sigma=1.0)    — positive carrying capacity
-      q     ~ HalfNormal(sigma=10)     — positive killing rate; wide prior
-      c0    ~ LogNormal(log(0.01), 1)  — strictly positive; log-scale prior
-                                         handles the small-number regime well
-      alpha ~ HalfNormal(sigma=4)      — positive Hill coefficient
-      sigma ~ HalfNormal(sigma=0.1)    — observational noise on OD
+    DF needs columns 'dosisAb' (ug/mL), 'Hours' and 'ODsmooth'.
+    Returns an arviz.InferenceData.
     """
-    with pm.Model() as generative_model:
+    if os.path.exists(filename) and not refit:
+        return az.from_netcdf(filename)
 
-        # Register CIP concentration, time, and initial density as PyMC Data
-        # objects so they can be swapped for posterior-predictive checks later.
-        c  = pm.Data("c",  DF.dosisAb)
-        t  = pm.Data("t",  DF.Hours)
-        y0 = pm.Data("y0", y0_input)
+    with pm.Model():
+        c = pm.Data('c', DF['dosisAb'].values)
+        t = pm.Data('t', DF['Hours'].values)
 
-        # --- Priors ---
-        r0    = pm.HalfNormal('r0')                         # antibiotic-free growth rate (h^-1)
-        K0    = pm.HalfNormal('K0')                         # antibiotic-free carrying capacity
-        q     = pm.HalfNormal('q', sigma=10.0)              # killing efficiency; wide prior
-        c0    = pm.LogNormal('c0', mu=np.log(0.01), sigma=1.0)  # half-saturation concentration
-        alpha = pm.HalfNormal('alpha', sigma=4.0)           # Hill cooperativity coefficient
-        sigma = pm.HalfNormal('sigma', sigma=0.1)           # OD measurement noise
-
-        # --- Likelihood ---
-        # The model prediction g(c, t, y0, ...) is compared to smoothed OD data.
-        # A Normal likelihood assumes additive Gaussian noise on the OD readings.
-        likelihood = pm.Normal(
-            "OD",
-            mu=g(c, t, y0, r0, K0, q, c0, alpha),
-            sigma=sigma,
-            observed=DF.ODsmooth
-        )
-
-        # --- Sampling ---
-        # NUTS (No-U-Turn Sampler) with 4 parallel chains.
-        # target_accept=0.95 reduces divergences in the curved posteriors
-        # that arise from near-MIC concentrations.
-        idata = pm.sample(
-            draws=draws,
-            tune=2000,
-            target_accept=0.95,
-            cores=4,
-            return_inferencedata=True
-        )
-
-        # Save only the groups needed for downstream analysis to keep file sizes manageable.
-        safe_groups = ["posterior", "posterior_predictive", "sample_stats"]
-        idata.to_netcdf(filename, groups=safe_groups)
-
-    return idata
-
-
-def fit_model_fixed_alpha(DF, filename, y0_input, draws=1000):
-    """
-    Variant of fit_model() with alpha constrained to a narrow Normal prior.
-
-    Used in the sensitivity analysis of Supplementary Fig. S6: alpha is
-    effectively fixed at 6.21 (the mean across all freely-fitted conditions)
-    to test whether the r0–q correlation and MIC dichotomy survive when the
-    Hill coefficient is not a free parameter.
-
-    As described in the manuscript Discussion, this regularisation helps in
-    most conditions but produces numerical instabilities at very high CHL
-    doses, making the free-alpha approach preferable in general.
-
-    Parameters
-    ----------
-    DF : pd.DataFrame
-        Same format as fit_model().
-    filename : str
-        Output NetCDF path.
-    y0_input : float
-        Initial OD_600.
-    draws : int
-        Number of posterior samples per chain (default 1000).
-        The tuning phase always uses 2000 steps.
-
-    Returns
-    -------
-    arviz.InferenceData
-    """
-    with pm.Model() as generative_model:
-
-        c  = pm.Data("c",  DF.dosisAb)
-        t  = pm.Data("t",  DF.Hours)
-        y0 = pm.Data("y0", y0_input)
-
-        r0    = pm.HalfNormal('r0')
-        K0    = pm.HalfNormal('K0')
-        q     = pm.HalfNormal('q', sigma=10.0)
-        c0    = pm.LogNormal('c0', mu=np.log(0.01), sigma=1.0)
-
-        # Tightly constrained Normal around the global mean alpha (6.21).
-        # sigma=0.01 makes this effectively a fixed value while remaining
-        # technically differentiable for the gradient-based NUTS sampler.
-        alpha = pm.Normal('alpha', mu=6.21, sigma=0.01)
-
+        r0 = pm.HalfNormal('r0', sigma=1.0)
+        K0 = pm.HalfNormal('K0', sigma=1.0)
+        q = pm.HalfNormal('q', sigma=10.0)
+        c0 = pm.LogNormal('c0', mu=np.log(0.01), sigma=1.0)
+        if alpha_fixed is None:
+            alpha = pm.HalfNormal('alpha', sigma=4.0)
+        else:
+            alpha = pm.Normal('alpha', mu=alpha_fixed, sigma=0.1)
+        psi = pm.HalfNormal('psi', sigma=4.0) if fit_psi else None
         sigma = pm.HalfNormal('sigma', sigma=0.1)
 
-        likelihood = pm.Normal(
-            "OD",
-            mu=g(c, t, y0, r0, K0, q, c0, alpha),
-            sigma=sigma,
-            observed=DF.ODsmooth
-        )
+        pm.Normal('OD', mu=g(c, t, y0, r0, K0, q, c0, alpha, psi),
+                  sigma=sigma, observed=DF['ODsmooth'].values)
 
-        idata = pm.sample(
-            draws=draws,
-            tune=2000,
-            target_accept=0.95,
-            cores=4,
-            return_inferencedata=True
-        )
-
-        safe_groups = ["posterior", "posterior_predictive", "sample_stats"]
-        idata.to_netcdf(filename, groups=safe_groups)
-
+        idata = pm.sample(draws=draws, tune=2000, target_accept=target_accept,
+                          cores=4, init=init, random_seed=RANDOM_SEED)
+    _save(idata, filename)
     return idata
+
+
+def fit_logistic(DF, filename, y0, refit=False):
+    """
+    Plain logistic fit to a single growth curve (one CIP concentration), the
+    comparison model of Fig. 1B. Priors r ~ U(0, 2), K ~ U(0, 1).
+    Loads `filename` instead if it exists and refit is False.
+    """
+    if os.path.exists(filename) and not refit:
+        return az.from_netcdf(filename)
+
+    with pm.Model():
+        t = pm.Data('t', DF['Hours'].values)
+        K = pm.Uniform('K', lower=0.0, upper=1.0)
+        r = pm.Uniform('r', lower=0.0, upper=2.0)
+        sigma = pm.HalfNormal('sigma')
+        pm.Normal('OD', mu=logistic(t, y0, r, K), sigma=sigma,
+                  observed=DF['ODsmooth'].values)
+        idata = pm.sample(draws=1000, tune=2000, target_accept=0.95, cores=4,
+                          random_seed=RANDOM_SEED)
+    _save(idata, filename)
+    return idata
+
+
+def fit_linear(x, y, filename, target_accept=0.95, refit=False):
+    """
+    Bayesian linear regression y = a + b x (used for q vs r0 in Figs. 5A
+    and S7A). Priors a, b ~ Normal(0, 40), sigma ~ HalfNormal(1).
+    """
+    if os.path.exists(filename) and not refit:
+        return az.from_netcdf(filename)
+
+    with pm.Model():
+        a = pm.Normal('a', sigma=40)
+        b = pm.Normal('b', sigma=40)
+        sigma = pm.HalfNormal('sigma')
+        pm.Normal('y_obs', mu=a + b * np.asarray(x), sigma=sigma, observed=np.asarray(y))
+        idata = pm.sample(draws=1000, tune=2000, target_accept=target_accept,
+                          cores=4, random_seed=RANDOM_SEED)
+    _save(idata, filename)
+    return idata
+
+
+# ---------------------------------------------------------------------------
+# Posterior summaries
+# ---------------------------------------------------------------------------
+
+def diagnostics(idata):
+    """Max R-hat, min bulk ESS and number of divergences of a fit."""
+    names = [v for v in MODEL_PARAMS + ['psi', 'sigma'] if v in idata.posterior]
+    rhat = az.rhat(idata, var_names=names)
+    ess = az.ess(idata, var_names=names)
+    return {'max_rhat': max(float(rhat[v]) for v in names),
+            'min_ess': min(float(ess[v]) for v in names),
+            'n_divergent': int(idata.sample_stats['diverging'].values.sum())}
+
+
+def posterior_draws(idata, n=1000, var_names=None):
+    """n random posterior samples (with replacement) as a dict of arrays."""
+    post = idata.posterior.stack(sample=('chain', 'draw'))
+    var_names = var_names or [v for v in MODEL_PARAMS + ['psi'] if v in post]
+    idx = rng.integers(0, post.sizes['sample'], n)
+    return {v: post[v].values[idx] for v in var_names}
+
+
+def summarise_posterior(idata, params=MODEL_PARAMS + ['MIC']):
+    """
+    Posterior median and 2.5% / 97.5% quantiles of each parameter and of the
+    MIC (Table 1). Returns {'r0_median': ..., 'r0_lower': ..., ...}.
+    """
+    out = {}
+    for par in params:
+        x = get_mic(idata, 'full') if par == 'MIC' else idata.posterior[par].values.ravel()
+        lower, median, upper = np.quantile(x, [0.025, 0.5, 0.975])
+        out.update({f'{par}_median': median, f'{par}_lower': lower, f'{par}_upper': upper})
+    return out
+
+
+def rK_summary(idata, doses, n=1000):
+    """
+    Posterior mean and SD of r(c) and K(c) at each dose (Fig. 1C-D). Samples
+    above the MIC (K < 0) are set to r = K = 0 so the summaries are physical.
+    Returns arrays Ravg, Rstd, Kavg, Kstd.
+    """
+    p = posterior_draws(idata, n)
+    Ravg, Rstd, Kavg, Kstd = [], [], [], []
+    for c in doses:
+        r, K = growth_params(c, p['r0'], p['K0'], p['q'], p['c0'], p['alpha'], p.get('psi'))
+        dead = K < 0
+        r, K = np.where(dead, 0.0, r), np.where(dead, 0.0, K)
+        Ravg.append(r.mean()); Rstd.append(r.std())
+        Kavg.append(K.mean()); Kstd.append(K.std())
+    return map(np.array, (Ravg, Rstd, Kavg, Kstd))
 
 
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
 
+def dose_colors(doses):
+    """One 'inferno' colour per CIP dose, in increasing dose order."""
+    doses = sorted(doses)
+    cmap = plt.get_cmap('inferno', len(doses))
+    return {dose: cmap(i) for i, dose in enumerate(doses)}
+
+
 def plot_data(DF, ax):
     """
-    Plot smoothed OD_600 growth curves from experimental data.
-
-    For each CIP concentration, the median OD across wells/replicates is
-    shown as a solid line and the interquartile range (Q1–Q3) as a shaded
-    band.  Colors follow the 'inferno' colormap ordered by concentration.
-
-    Parameters
-    ----------
-    DF : pd.DataFrame
-        Must contain: 'well', 'rep', 'Minutes', 'Hours', 'dosisAb', 'ODsmooth'.
-    ax : matplotlib.axes.Axes
-        Target axes.
-
-    Returns
-    -------
-    dict
-        {label: handle} mapping suitable for passing to ax.legend().
+    Median OD600 across wells/replicates (line) and interquartile range
+    (band) for each CIP dose. Returns {label: handle} for ax.legend().
+    Legend labels are in ng/mL.
     """
-    DF = DF.sort_values(by=['well', 'rep', 'Minutes'])
-    unique_doses = sorted(DF['dosisAb'].unique())
+    colors = dose_colors(DF['dosisAb'].unique())
+    stats = (DF.groupby(['dosisAb', 'Minutes'])['ODsmooth']
+               .agg(OD_median='median',
+                    OD_q1=lambda x: x.quantile(0.25),
+                    OD_q3=lambda x: x.quantile(0.75))
+               .reset_index())
+    stats['Hours'] = stats['Minutes'] / 60
 
-    # Assign a distinct inferno color to each CIP concentration
-    colors = plt.get_cmap('inferno', len(unique_doses))
-    color_dict = {dose: colors(i) for i, dose in enumerate(unique_doses)}
-
-    # Aggregate: median + IQR across wells and replicates for each (dose, time) pair
-    stats_df = DF.groupby(['dosisAb', 'Minutes'])['ODsmooth'].agg(
-        OD_median='median',
-        OD_q1=lambda x: x.quantile(0.25),
-        OD_q3=lambda x: x.quantile(0.75)
-    ).reset_index()
-    stats_df['Hours'] = stats_df['Minutes'] / 60
-
-    for dose in stats_df['dosisAb'].unique():
-        subset = stats_df[stats_df['dosisAb'] == dose]
-        # Label in ng/mL (data are stored in µg/mL)
-        line, = ax.plot(subset['Hours'], subset['OD_median'],
-                        label=1000 * dose, color=color_dict[dose])
-        ax.fill_between(
-            subset['Hours'],
-            subset['OD_q1'],
-            subset['OD_q3'],
-            color=line.get_color(),
-            alpha=0.2
-        )
+    for dose, sub in stats.groupby('dosisAb'):
+        ax.plot(sub['Hours'], sub['OD_median'], label=1000 * dose, color=colors[dose])
+        ax.fill_between(sub['Hours'], sub['OD_q1'], sub['OD_q3'],
+                        color=colors[dose], alpha=0.2)
 
     handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))   # deduplicate legend entries
-
     ax.set_xlabel('time (hours)')
     ax.set_ylabel('OD$_{600}$')
-    return by_label
+    return dict(zip(labels, handles))
 
 
-def plot_pred(ax, filename, unique_doses, y0):
+def _plot_band(ax, T, sims, color):
+    mean, sd = sims.mean(axis=0), sims.std(axis=0)
+    ax.plot(T, mean, ls='--', color=color)
+    ax.fill_between(T, mean - sd, mean + sd, color=color, alpha=0.25)
+
+
+def plot_pred(ax, filename, doses, y0, n=1000):
     """
-    Overlay posterior-predictive model trajectories on a data plot.
-
-    For each CIP concentration, 1000 parameter vectors are drawn at random
-    from the stored posterior, the model is evaluated for each, and the
-    mean ± 1 SD envelope is plotted as a dashed line with a shaded band.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        Axes on which to overlay predictions (should already contain data).
-    filename : str
-        Path to the NetCDF file with the fitted posterior.
-    unique_doses : array-like
-        Sorted list of CIP concentrations (µg/mL) to predict.
-    y0 : float
-        Initial OD_600 used during fitting.
+    Posterior-predictive model curves: for each dose, the mean +/- 1 SD of
+    g() over n random posterior samples (dashed line and band).
     """
-    # 'inferno' colormap must match the one used in plot_data()
-    colors = plt.get_cmap('inferno', len(unique_doses))
-    color_dict = {dose: colors(i) for i, dose in enumerate(unique_doses)}
-
-    T = np.linspace(0, 12, 100)   # dense time grid for smooth curves
-
-    # Load posterior and flatten chain/draw dimensions into a single 'samples' axis
-    samples = az.from_netcdf(filename)
-    posterior = samples.posterior.stack(samples=("draw", "chain"))
-
-    for c in unique_doses:
-        all_sims = []
-        # Draw 1000 random posterior samples (with replacement) for Monte Carlo averaging
-        for i in np.random.randint(0, posterior.samples.size, 1000):
-            r0i    = posterior["r0"].values[i]
-            K0i    = posterior["K0"].values[i]
-            qi     = posterior["q"].values[i]
-            c0i    = posterior["c0"].values[i]
-            alphai = posterior["alpha"].values[i]
-            ypred  = g(c, T, y0, r0i, K0i, qi, c0i, alphai)
-            all_sims.append(ypred)
-
-        average_sim = np.mean(all_sims, axis=0)
-        std_sim     = np.std(all_sims, axis=0)
-
-        ax.plot(T, average_sim, ls='--', color=color_dict[c])
-        ax.fill_between(T, average_sim - std_sim, average_sim + std_sim,
-                        color=color_dict[c], alpha=0.25)
+    T = np.linspace(0, T_MAX, 100)
+    colors = dose_colors(doses)
+    p = posterior_draws(az.from_netcdf(filename), n)
+    col = {k: v[:, None] for k, v in p.items()}
+    for c in sorted(doses):
+        sims = g(c, T[None, :], y0, col['r0'], col['K0'], col['q'], col['c0'],
+                 col['alpha'], col.get('psi'))
+        _plot_band(ax, T, sims, colors[c])
 
 
-def plot_pred_logistic(rep, ax, unique_doses, y0):
+def logistic_filename(rep, c):
+    return f'results/cip_logistic_standard_{rep}_dose_{c}_12h.nc'
+
+
+def plot_pred_logistic(rep, ax, doses, y0, n=1000):
+    """As plot_pred() for the independent per-dose logistic fits (Fig. 1B)."""
+    T = np.linspace(0, T_MAX, 100)
+    colors = dose_colors(doses)
+    for c in sorted(doses):
+        p = posterior_draws(az.from_netcdf(logistic_filename(rep, c)), n, ['r', 'K'])
+        sims = logistic(T[None, :], y0, p['r'][:, None], p['K'][:, None])
+        _plot_band(ax, T, sims, colors[c])
+
+
+def _mark_mic(ax, mic, mic_sd, ymin, ymax, text_x, text_y):
+    ax.vlines(mic, ymin=ymin, ymax=ymax, ls='dashed', color='k', alpha=0.5)
+    ax.fill_between([mic - mic_sd, mic + mic_sd], ymin, ymax, alpha=0.1, color='k')
+    ax.text(text_x, text_y, 'MIC (predicted)', rotation=90, fontsize=15)
+
+
+def replicate_figure(rep, mic_text_dx=0.001):
     """
-    Overlay posterior-predictive *independent logistic* trajectories.
-
-    Unlike plot_pred(), each CIP concentration has its own separately fitted
-    (r, K) posterior stored in individual NetCDF files
-    ('results/cip_logistic_standard_{rep}_dose_{c}_12h.nc').
-    This is the comparison model shown in Fig. 1B / Figs. S2–S5 panel B.
-
-    Parameters
-    ----------
-    rep : int
-        Biological replicate index (1–5).
-    ax : matplotlib.axes.Axes
-    unique_doses : array-like
-        CIP concentrations (µg/mL).
-    y0 : float
-        Initial OD_600.
+    Four-panel figure for one replicate of the standard condition
+    (Fig. 1 for rep 2; Figs. S2-S5 for reps 1, 3, 4, 5):
+      A  data + simultaneous model fit
+      B  data + independent logistic fits
+      C  r(c), model vs logistic
+      D  K(c), model vs logistic
+    Reads results/cip_model_standard_{rep}_12h.nc, the logistic posteriors
+    and results/rK_{rep}_12h.csv.
     """
-    colors = plt.get_cmap('inferno', len(unique_doses))
-    color_dict = {dose: colors(i) for i, dose in enumerate(unique_doses)}
+    DF = load_data('standard')
+    DF = DF[DF['rep'] == rep]
+    doses = sorted(DF['dosisAb'].unique())
+    filename = f'results/cip_model_standard_{rep}_12h.nc'
 
-    T = np.linspace(0, 12, 100)
+    fig = plt.figure(figsize=(12, 8))
 
-    for c in unique_doses:
-        all_sims = []
-        # Each concentration has its own NetCDF file from the per-curve fit
-        samples  = az.from_netcdf(f"results/cip_logistic_standard_{rep}_dose_{c}_12h.nc")
-        posterior = samples.posterior.stack(samples=("draw", "chain"))
+    for k, (label, predict) in enumerate([
+            ('model', lambda ax: plot_pred(ax, filename, doses, Y0_STANDARD)),
+            ('logistic', lambda ax: plot_pred_logistic(rep, ax, doses, Y0_STANDARD))]):
+        ax = fig.add_subplot(2, 2, k + 1)
+        by_label = plot_data(DF, ax)
+        predict(ax)
+        if label == 'logistic':
+            ax.legend(by_label.values(), by_label.keys(),
+                      title='CIP dose (ng/mL)', ncols=1, loc='upper left')
+        ax.set_xlim([0, 12])
+        ax.set_ylim([-0.01, 0.5])
+        ax.text(4, 0.45, label, fontsize=15)
+        ax.tick_params(labelsize=15)
+        ax.text(0.0, 1.05, 'AB'[k], fontsize=20, transform=ax.transAxes)
+        ax.set_xlabel(ax.get_xlabel(), fontsize=15)
+        ax.set_ylabel(ax.get_ylabel(), fontsize=15)
 
-        for i in np.random.randint(0, posterior.samples.size, 1000):
-            Ki    = posterior["K"].values[i]
-            ri    = posterior["r"].values[i]
-            ypred = logistic(T, y0, ri, Ki)
-            all_sims.append(ypred)
+    mic, mic_sd = get_mic(az.from_netcdf(filename))
+    rK = pd.read_csv(f'results/rK_{rep}_12h.csv')
+    colors = plt.get_cmap('tab20')
+    ticks = np.arange(0, 0.031, 0.005)
 
-        average_sim = np.mean(all_sims, axis=0)
-        std_sim     = np.std(all_sims, axis=0)
+    panels = [('C', 'R', 'growth rate', (-0.05, 1.9), 0.5, 0),
+              ('D', 'K', 'carrying capacity', (-0.03, 0.8), 0.25, 2)]
+    for k, (label, var, ylabel, ylim, text_y, ci) in enumerate(panels):
+        ax = fig.add_subplot(2, 2, k + 3)
+        ax.errorbar(rK.c, rK[var + 'avg'], yerr=rK[var + 'std'], marker='o',
+                    color=colors(ci), label='model')
+        ax.errorbar(rK.c, rK[var + 'avgL'], yerr=rK[var + 'stdL'], marker='o',
+                    color=colors(ci + 1), label='logistic')
+        ax.set_ylim(ylim)
+        _mark_mic(ax, mic, mic_sd, ylim[0], ylim[1], mic + mic_text_dx, text_y)
+        ax.set_xlabel('dose (ng/mL)', fontsize=15)
+        ax.set_ylabel(ylabel, fontsize=15)
+        ax.legend(fontsize=15)
+        ax.tick_params(labelsize=15)
+        ax.text(0.0, 1.05, label, fontsize=20, transform=ax.transAxes)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f'{1000 * z:.1f}' for z in ticks])
 
-        ax.plot(T, average_sim, ls='--', color=color_dict[c])
-        ax.fill_between(T, average_sim - std_sim, average_sim + std_sim,
-                        color=color_dict[c], alpha=0.25)
+    fig.tight_layout()
+    return fig
 
 
-# ---------------------------------------------------------------------------
-# MIC calculation
-# ---------------------------------------------------------------------------
+MEDIUM_COLORS = {'glucose': 'blue', 'glycerol': 'green', 'TMP': 'red', 'CHL': 'purple'}
 
-def solve_mic(r0, q, c0, alpha):
+
+def plot_linear_band(ax, idata, xp, color, n=1000):
+    """Mean +/- 1 SD of a + b x over n posterior samples of fit_linear()."""
+    p = posterior_draws(idata, n, ['a', 'b'])
+    sims = p['a'][:, None] + p['b'][:, None] * xp[None, :]
+    mean, sd = sims.mean(axis=0), sims.std(axis=0)
+    ax.plot(xp, mean, ls='-', color=color)
+    ax.fill_between(xp, mean - sd, mean + sd, color=color, alpha=0.25)
+
+
+def plot_q_and_mic_vs_r0(ax_q, ax_mic, table, linear_fits, fontsize=20):
     """
-    Numerically solve for the MIC (c*) given a single parameter vector.
-
-    The MIC satisfies the implicit equation (manuscript Eq. 6):
-
-        q * c* * (1 + (c*/c0)^alpha) = r0
-
-    which is obtained by setting r(c) = 0 (equivalently K(c) = 0).
-    The root is found with Brent's method on the bracket [0, 1000] µg/mL.
-
-    Parameters
-    ----------
-    r0, q, c0, alpha : float
-        Model parameters for a single posterior sample.
-
-    Returns
-    -------
-    float
-        MIC estimate in µg/mL, or np.nan if the solver fails to bracket a root.
+    q vs r0 (with the linear trends in `linear_fits`, {medium: idata}) and
+    MIC vs r0 for every medium condition, with 95% credible intervals.
+    `table` is a parameters table from summarise_posterior().
+    Shared by Fig. 5A/C and Fig. S7.
     """
+    def err(par, df):
+        return [df[f'{par}_median'] - df[f'{par}_lower'],
+                df[f'{par}_upper'] - df[f'{par}_median']]
 
-    # Note: Returns MIC in µg/mL. Multiply by 1000 when plotting for the manuscript (ng/mL).
-    
-    def equation(MIC):
-        # Rewritten as f(MIC) = 0 for root_scalar
-        return q * MIC * (1 + (MIC / c0) ** alpha) - r0
+    for medium in MEDIA:
+        df = table[table['medium'] == medium]
+        kw = dict(fmt='o', label=medium, color=MEDIUM_COLORS[medium], alpha=0.7)
+        ax_q.errorbar(df['r0_median'], df['q_median'], xerr=err('r0', df),
+                      yerr=err('q', df), **kw)
+        ax_mic.errorbar(df['r0_median'], df['MIC_median'], xerr=err('r0', df),
+                        yerr=err('MIC', df), **kw)
 
-    try:
-        res = root_scalar(equation, bracket=[0, 1000], method='brentq')
-        return res.root
-    except ValueError:
-        # No root in [0, 1000]: can happen if parameters place c* outside range
-        return np.nan
+    xp = np.linspace(0.5, 1.2, 100)
+    for medium, idata in linear_fits.items():
+        plot_linear_band(ax_q, idata, xp, MEDIUM_COLORS[medium])
 
+    ax_q.set_xlabel(r'$r_0$', fontsize=fontsize)
+    ax_q.set_ylabel(r'$q$', fontsize=fontsize)
+    ax_q.tick_params(labelsize=fontsize)
 
-def get_mic(idata_rep, output='simple'):
-    """
-    Compute the posterior distribution of the MIC from an InferenceData object.
-
-    The MIC is derived analytically from the five-parameter posterior for each
-    MCMC sample (Eq. 6), yielding a full posterior distribution over the MIC.
-    This propagates all parameter uncertainty into the MIC estimate, making it
-    more robust than computing it from posterior means alone.
-
-    Parameters
-    ----------
-    idata_rep : arviz.InferenceData
-        Fitted posterior (loaded from NetCDF).
-    output : {'simple', 'full'}
-        'simple' — return (mean, std) of the MIC posterior (default).
-        'full'   — return the full array of MIC posterior samples (used for
-                   Fig. 2A, where the full distribution is plotted).
-
-    Returns
-    -------
-    tuple (float, float) if output='simple'
-        (posterior mean MIC, posterior std MIC) in µg/mL.
-    ndarray if output='full'
-        All valid (non-NaN) MIC posterior samples.
-    """
-    # Vectorise solve_mic so it can operate element-wise on arrays
-    solve_mic_vec = np.vectorize(solve_mic)
-
-    # Extract flattened posterior chains for each parameter
-    r0_post    = idata_rep.posterior['r0'].values.flatten()
-    q_post     = idata_rep.posterior['q'].values.flatten()
-    c0_post    = idata_rep.posterior['c0'].values.flatten()
-    alpha_post = idata_rep.posterior['alpha'].values.flatten()
-
-    # Compute MIC for every posterior sample in parallel (vectorised)
-    mic_post_full = solve_mic_vec(r0_post, q_post, c0_post, alpha_post)
-
-    # Drop any samples where the solver failed to converge
-    mic_clean = mic_post_full[~np.isnan(mic_post_full)]
-
-    if output == 'full':
-        return mic_clean
-    else:
-        MICavg = np.nanmean(mic_post_full)
-        MICstd = np.nanstd(mic_post_full)
-        return MICavg, MICstd
+    ax_mic.set_xlabel(r'$r_0$', fontsize=fontsize)
+    ax_mic.set_ylabel('MIC (ng/mL)', fontsize=fontsize)
+    ax_mic.set_yscale('log')
+    ax_mic.set_yticks([0.01, 0.1, 1])
+    ax_mic.set_yticklabels([10, 100, 1000])
+    ax_mic.tick_params(labelsize=fontsize)

@@ -1,63 +1,75 @@
 # A mechanistic logistic model of ciprofloxacin action captures growth-killing coupling across diverse conditions
 
-This repository contains the data, models, and code necessary to reproduce the results and figures from the manuscript: 
-**"A mechanistic logistic model of ciprofloxacin action captures growth-killing coupling across diverse conditions"** by Marina de la Fuente García, Javier Molina-Hernández, Pablo Chávez, Pablo Catalán, and Saúl Ares.
+Data and code to reproduce the results and figures of the manuscript
+
+**"A mechanistic logistic model of ciprofloxacin action captures growth-killing coupling across diverse conditions"**
+by Marina de la Fuente García, Javier Molina-Hernández, Pablo Chávez, Pablo Catalán and Saúl Ares.
 
 ## Overview
-Quantifying how antibiotics inhibit bacterial growth is central to the rational design of treatments and to tracking antimicrobial resistance. Here we derive a five-parameter logistic model for the action of ciprofloxacin, a widely used bactericidal antibiotic, by coarse-graining a chromosome-level mechanistic model of its interaction with DNA gyrase. 
 
-Our model yields explicit analytical expressions for the drug-dependent growth rate and carrying capacity, capturing the characteristic nonlinear growth-inhibition curve of ciprofloxacin. It admits a closed-form solution that can be fitted directly to optical-density data across multiple drug concentrations simultaneously. 
+We model the action of ciprofloxacin (CIP) on *E. coli* with two coarse-grained variables, the cell density $N$ and the population's replication-fork content $f$. The fork density $\varphi = f/N$ obeys an equation that factorises into a function of $N$ times a function of $\varphi$, so the manifold $\varphi = \varphi^*(c)$ is invariant and attracting, and on it the system reduces **exactly** to a logistic equation
 
-Applying the model across a range of growth conditions—including varying carbon sources and bacteriostatic co-treatments—we find that the inferred parameters shift in biologically coherent ways. The minimum inhibitory concentration (MIC) emerges as an analytically derived quantity, and robust estimates can be obtained from as few as four concentrations. The model provides a unified, experimentally validated framework connecting chromosome-level drug mechanics to population-level dose-response.
+$$\dot N = r(c)\,N\left(1 - \frac{N}{K(c)}\right),\qquad r(c) = r_0\,\Phi(c)\,\frac{1 - qc\,h(c)}{h(c)},\qquad K(c) = K_0\,\bigl(1 - qc\,h(c)\bigr),$$
 
-## Repository Structure
+with $h(c) = 1 + (c/c_0)^\alpha$ and $\Phi(c) = \varphi^*(c)/\varphi^*(0)$. Fixing the fork completion rate at $d = 1\ \mathrm{h^{-1}}$ leaves five parameters, $(r_0, K_0, q, c_0, \alpha)$, which are fitted by Bayesian inference simultaneously to all growth curves of a CIP dose-response experiment. The MIC follows analytically as the root of $q\,c^*\,h(c^*) = 1$.
 
-* `preprocessing_median.py`: Script to generate the rolling median data from raw OD data. Creates the file 'cip_dose_response_all.csv' from 'cip_dose_response_raw.csv'. No need to run this, it is included for reproducibility.
-* `functions.py`: Shared utilities for Bayesian inference, model simulation, and plotting used throughout the analysis. Contains the core logic for the five-parameter logistic model and MIC extraction.
-* `cip_model_bayesian_inference.ipynb`: The core modeling notebook. It runs all MCMC fits and computes the intermediate results (NetCDF posteriors, CSV summary tables) across diverse conditions (glucose, glycerol, TMP, CHL).
-* `main_figures.ipynb`: Generates the main figures of the manuscript (Figs. 1–4).
-* `supp_figures.ipynb`: Generates all supplementary figures (Figs. S1–S6).
-* `data/`: Directory containing the raw experimental OD data.
-* `results/`: Directory where the intermediate posteriors (`.nc`) and parameter summaries (`.csv`) are saved by the inference notebook.
-* `figures/`: Directory where the generated `.pdf` figures are saved.
+## Repository structure
+
+| Path | Content |
+|---|---|
+| `functions.py` | Model equations, data loading, Bayesian fits, MIC calculation, posterior summaries and shared plotting code. Imported by all notebooks. |
+| `cip_model_bayesian_inference.ipynb` | Runs every fit and writes all intermediate results to `results/`. |
+| `main_figures.ipynb` | Figures 1–5 of the main text. |
+| `supp_figures.ipynb` | Supplementary Figures S1–S7. |
+| `preprocessing_median.py` | Builds `data/cip_dose_response_all.csv` (rolling-median smoothed OD) from `data/cip_dose_response_raw.csv`. Included for completeness; the smoothed file is already provided. |
+| `data/` | Raw and smoothed OD600 data. |
+| `results/` | Posteriors (`.nc`, NetCDF) and summary tables (`.csv`) written by the inference notebook. |
+| `figures/` | PDF figures written by the figure notebooks. |
+
+### Figures and the results they use
+
+| Figure | Notebook | Results files |
+|---|---|---|
+| Fig. 1, Figs. S2–S5 | `main_figures`, `supp_figures` | `cip_model_standard_{rep}_12h.nc`, `cip_logistic_standard_{rep}_dose_{c}_12h.nc`, `rK_{rep}_12h.csv` |
+| Fig. 2 | `main_figures` | `mic_convergence_data_linear_add.csv`, `cip_model_cv.csv` |
+| Figs. 3–4, Table 1 | `main_figures` | `cip_model_{medium}_{cond}_12h.nc`, `parameters_table.csv` |
+| Fig. 5 | `main_figures` | `parameters_table.csv`, `{TMP,CHL}_linear_fit.nc` |
+| Fig. S1 | `supp_figures` | `parameters_table.csv` (glucose 0.2%) |
+| Fig. S6 | `supp_figures` | `mic_convergence_combinations_12h.csv`, `rhat_scores_combinations_12h.csv` |
+| Fig. S7 | `supp_figures` | `parameters_table_fixed_alpha.csv`, `{TMP,CHL}_linear_fit_fixed_alpha.nc` |
 
 ## Installation
 
-To ensure full reproducibility, we recommend using Conda to manage your Python environment. 
-
-1. Clone the repository:
-   git clone https://github.com/pablocatalan/cirpofloxacin.git
-   cd ciprofloxacin
-
-2. Create the Conda environment from the provided environment.yml file:
-   conda env create -f environment.yml
-
-3. Activate the environment:
-   conda activate alternativa_cip
+```bash
+git clone https://github.com/PabloCatalan/ciprofloxacin.git
+cd ciprofloxacin
+conda env create -f environment.yml
+conda activate cip_model
+```
 
 ## Usage
 
-**Important:** You must generate the Bayesian inference results before attempting to plot the figures. Please run the notebooks in the following order:
+Run the notebooks from the repository root, in this order:
 
-1. `cip_model_bayesian_inference.ipynb`
-   * Run this notebook first.
-   * It performs simultaneous model fits to the CIP concentrations, independent logistic fits, MIC robustness analysis, and fits across varying carbon sources and co-treatments.
-   * Outputs will be automatically saved to the `results/` folder.
+1. **`cip_model_bayesian_inference.ipynb`** fits the model and writes everything in `results/`.
+2. **`main_figures.ipynb`** and **`supp_figures.ipynb`** read `results/` and write the PDFs to `figures/`.
 
-2. `main_figures.ipynb`
-   * Reads pre-computed posteriors from `results/` and saves the main manuscript figures as PDFs in the `figures/` folder.
+Each fit is skipped when its output file already exists in `results/`, and the stored posterior is loaded instead. With the posteriors in place, the inference notebook therefore only rebuilds the summary tables and runs in minutes. To repeat a fit, delete its `.nc` file (or call the fitting function with `refit=True`). Fitting everything from scratch takes several hours on a 4-core machine (about 150 fits). Sampling and the posterior draws used in plots are seeded (`RANDOM_SEED` in `functions.py`).
 
-3. `supp_figures.ipynb`
-   * Reads pre-computed posteriors and produces the supplementary figures, saving them to the `figures/` folder.
+### Notes on the data
 
-### A Note on Units
-Please note that all raw data, internal calculations, and Bayesian posteriors saved in the `results/` folder use **µg/mL** for ciprofloxacin concentrations. However, for clarity and readability, the figures generated in the notebooks and presented in the manuscript display the concentrations in **ng/mL** (a conversion factor of 1000). If you are inspecting the code or raw data tables, keep in mind that a value like `0.015` corresponds to `15 ng/mL` in the paper.
+- All fits use the first 12 h of each growth curve (`T_MAX` in `functions.py`).
+- Two rows (F and G) of the chloramphenicol plate (day 251203) failed to grow in every well, including the drug-free controls. They are excluded from all fits and plots by `load_data()` (`EXCLUDED_ROWS` in `functions.py`).
+- The standard-medium experiments were inoculated at OD ≈ 0.001 and the medium-perturbation series (glucose, glycerol, TMP, CHL) at OD ≈ 0.003.
+
+### Units
+
+Raw data, all calculations and every file in `results/` use **µg/mL** for CIP. Figures and the manuscript report **ng/mL**: a stored value of `0.015` is 15 ng/mL. The conversion happens only at the plotting stage.
 
 ## Citation
 
-If you use this code or model in your research, please cite our manuscript:
-
-> de la Fuente García M, Molina-Hernández J, Chávez P, Catalán P, Ares S. (2024). A mechanistic logistic model of ciprofloxacin action captures growth-killing coupling across diverse conditions. [Journal Name]. DOI: [Insert DOI here]
+> de la Fuente García M, Molina-Hernández J, Chávez P, Catalán P, Ares S. A mechanistic logistic model of ciprofloxacin action captures growth-killing coupling across diverse conditions. *Journal*, year. DOI: to be added.
 
 ## License
-MIT License - see the LICENSE file for details.
+
+MIT License. See `LICENSE`.
